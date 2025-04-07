@@ -15,7 +15,6 @@ private:
 
     std::vector<uint16_t> adc_values_;
     uint32_t battery_level_ = 0;
-    uint32_t old_average_adc = 0;
     bool is_charging_ = false;
     bool is_low_battery_ = false;
     int ticks_ = 0;
@@ -110,17 +109,8 @@ private:
                 }
             }
         }
-        if(average_adc > old_average_adc)
-        {
-            is_charging_ = true;
-        }
-        else
-        {
-            is_charging_ = false;
-        }
 
         ESP_LOGI("PowerManager", "ADC value: %d average: %ld level: %ld", adc_value, average_adc, battery_level_);
-        old_average_adc = average_adc;
     }
 
 public:
