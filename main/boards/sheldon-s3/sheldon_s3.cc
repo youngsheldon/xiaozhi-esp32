@@ -22,11 +22,55 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include <esp_sleep.h>
+#include "i2c_device.h"
 
 #define TAG "SheldonS3"
 
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_awesome_20_4);
+
+class Cst816s : public I2cDevice
+{
+public:
+    struct TouchPoint_t
+    {
+        int num = 0;
+        int x = -1;
+        int y = -1;
+    };
+    Cst816s(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
+    {
+        uint8_t chip_id = ReadReg(0xA3);
+        ESP_LOGI(TAG, "Get chip ID: 0x%02X", chip_id);
+        read_buffer_ = new uint8_t[6];
+    }
+
+    ~Cst816s()
+    {
+        delete[] read_buffer_;
+    }
+
+    void UpdateTouchPoint()
+    {
+        ReadRegs(0x02, read_buffer_, 6);
+        tp_.num = read_buffer_[0] & 0x0F;
+        tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
+        tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
+        if(tp_.x == 0 || tp_.y == 0 || tp_.x == 4095 || tp_.y == 4095)
+        {
+            tp_.num = 0;
+        }
+    }
+
+    const TouchPoint_t &GetTouchPoint()
+    {
+        return tp_;
+    }
+
+private:
+    uint8_t *read_buffer_ = nullptr;
+    TouchPoint_t tp_;
+};
 
 class CustomLcdDisplay : public SpiLcdDisplay
 {
@@ -58,7 +102,8 @@ public:
 class SheldonS3 : public WifiBoard
 {
 private:
-    i2c_master_bus_handle_t codec_i2c_bus_;
+    i2c_master_bus_handle_t i2c_bus_;
+    Cst816s* cst816s_;
     Button boot_button_;
     Button volume_up_button_;
     Button volume_down_button_;
@@ -66,6 +111,84 @@ private:
     PowerSaveTimer *power_save_timer_;
     PowerManager *power_manager_;
     esp_lcd_panel_handle_t panel_handle = NULL;
+    esp_timer_handle_t touchpad_timer_;
+
+    void InitializeI2c()
+    {
+        // Initialize I2C peripheral
+        i2c_master_bus_config_t i2c_bus_cfg = {
+            .i2c_port = (i2c_port_t)1,
+            .sda_io_num = I2C_SDA_PIN,
+            .scl_io_num = I2C_SCL_PIN,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .intr_priority = 0,
+            .trans_queue_depth = 0,
+            .flags = {
+                .enable_internal_pullup = 1,
+            },
+        };
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+    }
+
+    static void touchpad_timer_callback(void *arg)
+    {
+        auto &board = (SheldonS3 &)Board::GetInstance();
+        auto touchpad = board.GetTouchpad();
+        static bool was_touched = false;
+        static int64_t touch_start_time = 0;
+        const int64_t TOUCH_THRESHOLD_MS = 500; // 触摸时长阈值，超过500ms视为长按
+
+        touchpad->UpdateTouchPoint();
+        auto touch_point = touchpad->GetTouchPoint();
+        if (touch_point.num > 0) 
+        {
+            ESP_LOGI(TAG, "Touch point: %d, %d", touch_point.x, touch_point.y);
+        }
+
+        // 检测触摸开始
+        if (touch_point.num > 0 && !was_touched)
+        {
+            was_touched = true;
+            touch_start_time = esp_timer_get_time() / 1000; // 转换为毫秒
+        }
+        // 检测触摸释放
+        else if (touch_point.num == 0 && was_touched)
+        {
+            was_touched = false;
+            int64_t touch_duration = (esp_timer_get_time() / 1000) - touch_start_time;
+
+            // 只有短触才触发
+            if (touch_duration < TOUCH_THRESHOLD_MS)
+            {
+                auto &app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateStarting &&
+                    !WifiStation::GetInstance().IsConnected())
+                {
+                    board.ResetWifiConfiguration();
+                }
+                app.ToggleChatState();
+            }
+        }
+    }
+
+    void InitializeCst816sTouchPad()
+    {
+        ESP_LOGI(TAG, "Init Cst816s");
+        cst816s_ = new Cst816s(i2c_bus_, 0x15);
+
+        // 创建定时器，10ms 间隔
+        esp_timer_create_args_t timer_args = {
+            .callback = touchpad_timer_callback,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "touchpad_timer",
+            .skip_unhandled_events = true,
+        };
+
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &touchpad_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(touchpad_timer_, 10 * 1000)); // 10ms = 10000us
+    }
 
     void InitializePowerManager()
     {
@@ -201,6 +324,8 @@ public:
     SheldonS3() : boot_button_(BOOT_BUTTON_GPIO), volume_up_button_(VOLUME_UP_BUTTON_GPIO),
                   volume_down_button_(VOLUME_DOWN_BUTTON_GPIO)
     {
+        InitializeI2c();
+        InitializeCst816sTouchPad();
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeSpi();
@@ -255,6 +380,11 @@ public:
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveMode(enabled);
+    }
+
+    Cst816s *GetTouchpad()
+    {
+        return cst816s_;
     }
 };
 
