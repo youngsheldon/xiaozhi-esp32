@@ -23,6 +23,7 @@
 #include "driver/spi_master.h"
 #include <esp_sleep.h>
 #include "i2c_device.h"
+#include <driver/rtc_io.h>
 
 #define TAG "SheldonS3"
 
@@ -204,7 +205,7 @@ private:
 
     void InitializePowerSaveTimer()
     {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_ = new PowerSaveTimer(-1, 10, 15);
         power_save_timer_->OnEnterSleepMode([this]()
                                             {
             ESP_LOGI(TAG, "Enabling sleep mode");
@@ -219,6 +220,9 @@ private:
         power_save_timer_->OnShutdownRequest([this]()
                                              {
             ESP_LOGI(TAG, "Shutting down");
+            rtc_gpio_pullup_en(GPIO_NUM_2);
+            rtc_gpio_pulldown_dis(GPIO_NUM_2);
+            esp_sleep_enable_ext0_wakeup(GPIO_NUM_2, 0);  
             esp_lcd_panel_disp_on_off(panel_handle, false); //关闭显示
             esp_deep_sleep_start(); });
         power_save_timer_->SetEnabled(true);
