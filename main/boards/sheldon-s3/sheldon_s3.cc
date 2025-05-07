@@ -220,9 +220,9 @@ private:
         power_save_timer_->OnShutdownRequest([this]()
                                              {
             ESP_LOGI(TAG, "Shutting down");
-            rtc_gpio_pullup_en(GPIO_NUM_2);
-            rtc_gpio_pulldown_dis(GPIO_NUM_2);
-            esp_sleep_enable_ext0_wakeup(GPIO_NUM_2, 0);  
+            rtc_gpio_pullup_en(GPIO_NUM_1);
+            rtc_gpio_pulldown_dis(GPIO_NUM_1);
+            esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, 0);  
             esp_lcd_panel_disp_on_off(panel_handle, false); //关闭显示
             esp_deep_sleep_start(); });
         power_save_timer_->SetEnabled(true);
