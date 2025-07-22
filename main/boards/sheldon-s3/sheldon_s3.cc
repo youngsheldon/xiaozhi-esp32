@@ -103,6 +103,22 @@ public:
     }
 };
 
+// 双缓冲区结构定义
+#define BUFFER_COUNT 2
+#define BUFFER_SIZE (4096 * 8) // 增大缓冲区至32KB
+
+typedef struct
+{
+    uint8_t data[BUFFER_SIZE];
+    size_t size;
+    bool ready;
+    SemaphoreHandle_t mutex;
+} AudioBuffer;
+
+AudioBuffer audioBuffers[BUFFER_COUNT];
+QueueHandle_t bufferQueue; // 缓冲区队列，用于通知解码任务
+bool decodingActive = false;
+
 class SheldonS3 : public WifiBoard
 {
 private:
@@ -116,6 +132,7 @@ private:
     PowerManager *power_manager_;
     esp_lcd_panel_handle_t panel_handle = NULL;
     esp_timer_handle_t touchpad_timer_;
+
     void InitializeI2c()
     {
         // Initialize I2C peripheral
@@ -285,24 +302,22 @@ private:
 
         volume_up_button_.OnClick([this]()
                                   {
-                power_save_timer_->WakeUp();
-                auto codec = GetAudioCodec();
-                auto volume = codec->output_volume() + 10;
-                if (volume > 100) {
-                    volume = 100;
-                }
-                codec->SetOutputVolume(volume);
-                GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume)); 
+                                      power_save_timer_->WakeUp();
+                                      auto codec = GetAudioCodec();
+                                      auto volume = codec->output_volume() + 10;
+                                      if (volume > 100)
+                                      {
+                                          volume = 100;
+                                      }
+                                      codec->SetOutputVolume(volume);
+                                      GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
 
-                xTaskCreate([](void* arg) 
-                {
+                                      xTaskCreate([](void *arg)
+                                                  {
                     SheldonS3* app = (SheldonS3*)arg;
-                    app->PlayHttpMp3("http://lw.sycdn.kuwo.cn/ffc2845e78aa4567160d2f4ee3e25e0f/687df5c8/resource/30106/trackmedia/M500002dOqLZ3Effbw.mp3");
-                    vTaskDelete(NULL);
-                },              
-                "PlayHttpMp3", 4096 * 10, this, 8, NULL); 
-
-                });
+                    app->PlayHttpMp3("http://er.sycdn.kuwo.cn/6f0fcc6ad951672c7ab7acdb23a1d608/687e4426/resource/30106/trackmedia/M5000039MnYb0qxYhV.mp3");
+                    vTaskDelete(NULL); },
+                                                  "PlayHttpMp3", 4096 * 10, this, 8, NULL); });
 
         volume_up_button_.OnLongPress([this]()
                                       {
@@ -337,22 +352,129 @@ private:
         thing_manager.AddThing(iot::CreateThing("Battery"));
     }
 
-    void PlayHttpMp3(const std::string &url)
+    // 优化的MP3解码函数（支持双缓冲区和错误恢复）
+    static void mp3DecodingTask(void *pvParameters)
     {
-        HMP3Decoder decoder;
-        MP3FrameInfo frame_info;
-
-        decoder = MP3InitDecoder();
-        if (!decoder)
+        HMP3Decoder decoder = MP3InitDecoder();
+        if (decoder == NULL)
         {
             ESP_LOGE(TAG, "Failed to initialize MP3 decoder");
+            vTaskDelete(NULL);
             return;
         }
 
+        MP3FrameInfo frame_info;
+        int16_t outBuf[MAX_NCHAN * MAX_NGRAN * MAX_NSAMP];
+        AudioBuffer *buffer;
+
+        decodingActive = true;
+        while (decodingActive)
+        {
+            // 等待可用的缓冲区
+            if (xQueueReceive(bufferQueue, &buffer, portMAX_DELAY) != pdTRUE)
+            {
+                continue;
+            }
+
+            xSemaphoreTake(buffer->mutex, portMAX_DELAY);
+            if (buffer->size == 0)
+            {
+                xSemaphoreGive(buffer->mutex);
+                continue;
+            }
+
+            uint8_t *readPtr = buffer->data;
+            int bytesAvailable = buffer->size;
+            int offset = 0;
+            int decodeErrors = 0;
+
+            // 循环解码当前缓冲区中的所有MP3帧
+            while (bytesAvailable > 4)
+            { // 至少保留4字节用于同步字检测
+                offset = MP3FindSyncWord(readPtr, bytesAvailable);
+                if (offset < 0)
+                {
+                    break; // 没有找到同步字，退出循环
+                }
+
+                readPtr += offset;
+                bytesAvailable -= offset;
+
+                // 尝试解码帧
+                int err = MP3Decode(decoder, &readPtr, &bytesAvailable, outBuf, 0);
+                if (err)
+                {
+                    ESP_LOGE(TAG, "MP3 decode error: %d", err);
+
+                    // 错误恢复逻辑
+                    if (err == ERR_MP3_MAINDATA_UNDERFLOW)
+                    {
+                        // 主数据不足，尝试跳过部分数据
+                        if (bytesAvailable > 1024)
+                        {
+                            readPtr += 512;
+                            bytesAvailable -= 512;
+                        }
+                        decodeErrors++;
+
+                        // 如果连续错误超过阈值，退出当前缓冲区处理
+                        if (decodeErrors > 5)
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    else
+                    {
+                        // 其他致命错误，退出解码
+                        break;
+                    }
+                }
+                else
+                {
+                    decodeErrors = 0; // 重置错误计数器
+                    MP3GetLastFrameInfo(decoder, &frame_info);
+                    ESP_LOGI(TAG, "Frame bitrate: %d, nChans: %d, samprate: %d, bitsPerSample: %d, outputSamps: %d, layer: %d, version: %d", frame_info.bitrate, frame_info.nChans, frame_info.samprate, frame_info.bitsPerSample, frame_info.outputSamps, frame_info.layer, frame_info.version);
+                    // 处理解码后的PCM数据
+                    // configureTX(frame_info.samprate, ...);
+                    // write((uint8_t *)outBuf, ...);
+                }
+            }
+
+            // 标记缓冲区为可用状态
+            buffer->size = 0;
+            buffer->ready = false;
+            xSemaphoreGive(buffer->mutex);
+        }
+
+        MP3FreeDecoder(decoder);
+        vTaskDelete(NULL);
+    }
+
+    // 优化的HTTP MP3流播放函数
+    void PlayHttpMp3(const std::string &url)
+    {
+        ESP_LOGI(TAG, "Start playing MP3 from URL: %s", url.c_str());
+        // 初始化双缓冲区
+        for (int i = 0; i < BUFFER_COUNT; i++)
+        {
+            audioBuffers[i].size = 0;
+            audioBuffers[i].ready = false;
+            audioBuffers[i].mutex = xSemaphoreCreateMutex();
+        }
+
+        bufferQueue = xQueueCreate(BUFFER_COUNT, sizeof(AudioBuffer *));
+        xTaskCreate(mp3DecodingTask, "mp3_decoder", 8192, NULL, 5, NULL);
+
         auto http = Board::GetInstance().CreateHttp();
+        http->SetHeader("Icy-MetaData", "1");
+        http->SetHeader("Accept-Encoding", "identity;q=1,*;q=0");
+        http->SetHeader("Connection", "keep-alive");
+
         if (!http->Open("GET", url))
         {
             ESP_LOGE(TAG, "Failed to open URL: %s", url.c_str());
+            decodingActive = false;
             return;
         }
 
@@ -360,36 +482,149 @@ private:
         if (status_code != 200)
         {
             ESP_LOGE(TAG, "Failed to check version, status code: %d", status_code);
+            http->Close();
+            decodingActive = false;
             return;
         }
 
-        char buffer[4096];
-        int read_len;
+        int currentBuffer = 0;
+        int bytesRead = 0;
+        bool eofReached = false;
 
-        while ((read_len = http->Read(buffer, sizeof(buffer))) > 0)
+        // 主循环：持续读取数据到缓冲区
+        while (!eofReached && decodingActive)
         {
-            unsigned char *buf = reinterpret_cast<unsigned char *>(buffer);
-            int bytes_left = read_len;
+            // 获取当前可用缓冲区
+            xSemaphoreTake(audioBuffers[currentBuffer].mutex, portMAX_DELAY);
 
-            while (bytes_left > 0)
+            // 只有当缓冲区为空时才填充数据
+            if (audioBuffers[currentBuffer].size == 0)
             {
-                short pcm[8192];
-                int samples = MP3Decode(decoder, &buf, &bytes_left, pcm, 0);
-                if (samples > 0)
+                int len = http->Read((char*)audioBuffers[currentBuffer].data, BUFFER_SIZE);
+
+                if (len <= 0)
                 {
-                    MP3GetLastFrameInfo(decoder, &frame_info);
-                    ESP_LOGI(TAG, "Frame bitrate: %d, nChans: %d, samprate: %d, bitsPerSample: %d, outputSamps: %d, layer: %d, version: %d", frame_info.bitrate, frame_info.nChans, frame_info.samprate, frame_info.bitsPerSample, frame_info.outputSamps, frame_info.layer, frame_info.version);
-                    // play_pcm(pcm, samples);
+                    ESP_LOGI(TAG, "End of stream or read error");
+                    eofReached = true;
                 }
-                else if (samples < 0 && samples != ERR_MP3_INDATA_UNDERFLOW)
+                else
                 {
-                    ESP_LOGE(TAG, "MP3 decode error: %d", samples);
+                    audioBuffers[currentBuffer].size = len;
+                    audioBuffers[currentBuffer].ready = true;
+
+                    // 将缓冲区指针放入队列通知解码任务
+                    xQueueSend(bufferQueue, &audioBuffers[currentBuffer], portMAX_DELAY);
                 }
             }
+
+            xSemaphoreGive(audioBuffers[currentBuffer].mutex);
+
+            // 切换到下一个缓冲区
+            currentBuffer = (currentBuffer + 1) % BUFFER_COUNT;
+
+            // 短暂延时，避免CPU占用过高
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
+
+        // 等待所有缓冲区处理完毕
+        vTaskDelay(pdMS_TO_TICKS(500));
+        decodingActive = false;
         http->Close();
-        MP3FreeDecoder(decoder);
+
+        // 清理资源
+        for (int i = 0; i < BUFFER_COUNT; i++)
+        {
+            vSemaphoreDelete(audioBuffers[i].mutex);
+        }
+        vQueueDelete(bufferQueue);
     }
+
+    // bool playMP3(uint8_t *src, size_t src_len)
+    // {
+    //     int16_t outBuf[MAX_NCHAN * MAX_NGRAN * MAX_NSAMP];
+    //     uint8_t *readPtr = NULL;
+    //     int bytesAvailable = 0, err = 0, offset = 0;
+    //     MP3FrameInfo frame_info;
+    //     HMP3Decoder decoder = NULL;
+
+    //     bytesAvailable = src_len;
+    //     readPtr = src;
+
+    //     decoder = MP3InitDecoder();
+    //     if (decoder == NULL)
+    //     {
+    //         ESP_LOGE(TAG, "Failed to initialize MP3 decoder");
+    //         return false;
+    //     }
+
+    //     do
+    //     {
+    //         offset = MP3FindSyncWord(readPtr, bytesAvailable);
+    //         if (offset < 0)
+    //         {
+    //             break;
+    //         }
+    //         readPtr += offset;
+    //         bytesAvailable -= offset;
+    //         err = MP3Decode(decoder, &readPtr, &bytesAvailable, outBuf, 0);
+    //         if (err)
+    //         {
+    //             ESP_LOGE(TAG, "MP3 decode error: %d", err);
+    //             MP3FreeDecoder(decoder);
+    //             return false;
+    //         }
+    //         else
+    //         {
+    //             MP3GetLastFrameInfo(decoder, &frame_info);
+    //             ESP_LOGI(TAG, "Frame bitrate: %d, nChans: %d, samprate: %d, bitsPerSample: %d, outputSamps: %d, layer: %d, version: %d", frame_info.bitrate, frame_info.nChans, frame_info.samprate, frame_info.bitsPerSample, frame_info.outputSamps, frame_info.layer, frame_info.version);
+    //             // configureTX(frameInfo.samprate, (i2s_data_bit_width_t)frameInfo.bitsPerSample, (i2s_slot_mode_t)frameInfo.nChans);
+    //             // write((uint8_t *)outBuf, (size_t)((frameInfo.bitsPerSample / 8) * frameInfo.outputSamps));
+
+    //         }
+    //     } while (true);
+    //     MP3FreeDecoder(decoder);
+    //     return true;
+    // }
+
+    // void PlayHttpMp3(const std::string &url)
+    // {
+    //     auto http = Board::GetInstance().CreateHttp();
+    //     http->SetHeader("Icy-MetaData", "1");
+    //     http->SetHeader("Accept-Encoding", "identity;q=1,*;q=0");
+    //     http->SetHeader("Connection", "keep-alive");
+
+    //     if (!http->Open("GET", url))
+    //     {
+    //         ESP_LOGE(TAG, "Failed to open URL: %s", url.c_str());
+    //         return;
+    //     }
+
+    //     auto status_code = http->GetStatusCode();
+    //     if (status_code != 200)
+    //     {
+    //         ESP_LOGE(TAG, "Failed to check version, status code: %d", status_code);
+    //         return;
+    //     }
+
+    //     int bufferSize = 4096*5; // 4KB buffer
+    //     char buffer[bufferSize];
+    //     int size = http->GetBodyLength();
+    //     int bytesRead = 0;
+    //     while ((bytesRead < size))
+    //     {
+    //         int len = http->Read(buffer, bufferSize);
+    //         if (len <= 0)
+    //         {
+    //             ESP_LOGE(TAG, "Failed to read data from URL: %s", url.c_str());
+    //             break;
+    //         }
+
+    //         playMP3((uint8_t *)buffer, len);
+
+    //         bytesRead += len;
+    //     }
+    //     http->Close();
+    // }
 
 public:
     SheldonS3() : boot_button_(BOOT_BUTTON_GPIO), volume_up_button_(VOLUME_UP_BUTTON_GPIO),
