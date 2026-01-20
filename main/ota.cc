@@ -206,38 +206,9 @@ esp_err_t Ota::CheckVersion() {
     } else {
         ESP_LOGW(TAG, "No server_time section found!");
     }
-
-    has_new_version_ = false;
-    cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
-    if (cJSON_IsObject(firmware)) {
-        cJSON *version = cJSON_GetObjectItem(firmware, "version");
-        if (cJSON_IsString(version)) {
-            firmware_version_ = version->valuestring;
-        }
-        cJSON *url = cJSON_GetObjectItem(firmware, "url");
-        if (cJSON_IsString(url)) {
-            firmware_url_ = url->valuestring;
-        }
-
-        if (cJSON_IsString(version) && cJSON_IsString(url)) {
-            // Check if the version is newer, for example, 0.1.0 is newer than 0.0.1
-            has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
-            if (has_new_version_) {
-                ESP_LOGI(TAG, "New version available: %s", firmware_version_.c_str());
-            } else {
-                ESP_LOGI(TAG, "Current is the latest version");
-            }
-            // If the force flag is set to 1, the given version is forced to be installed
-            cJSON *force = cJSON_GetObjectItem(firmware, "force");
-            if (cJSON_IsNumber(force) && force->valueint == 1) {
-                has_new_version_ = true;
-            }
-        }
-    } else {
-        ESP_LOGW(TAG, "No firmware section found!");
-    }
-
     cJSON_Delete(root);
+    has_new_version_ = false;
+    CheckCustomFirmwareUpdate();
     return ESP_OK;
 }
 
@@ -470,4 +441,41 @@ esp_err_t Ota::Activate() {
 
     ESP_LOGI(TAG, "Activation successful");
     return ESP_OK;
+}
+
+void Ota::CheckCustomFirmwareUpdate()
+{
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    if (!http->Open("GET", "https://frp-sea.com:18001/ota/check")) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection");
+        return;
+    }
+
+    if (http->GetStatusCode() != 200) {
+        ESP_LOGE(TAG, "Failed to get firmware, status code: %d", http->GetStatusCode());
+        return;
+    }
+
+    auto data = http->ReadAll();
+    http->Close();
+    cJSON *root = cJSON_Parse(data.c_str());
+    if (root == NULL) {
+        ESP_LOGE(TAG, "Failed to parse JSON data");
+        return;
+    }
+
+    cJSON *url = cJSON_GetObjectItem(root, "url");
+    cJSON *version = cJSON_GetObjectItem(root, "version");
+    if (cJSON_IsString(url) && cJSON_IsString(version)) {
+        firmware_url_ = url->valuestring;
+        firmware_version_ = version->valuestring;
+        has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
+        if (has_new_version_) {
+            ESP_LOGI(TAG, "New version available: %s", firmware_version_.c_str());
+        } else {
+            ESP_LOGI(TAG, "Current is the latest version");
+        }
+    } 
+    cJSON_Delete(root);
 }
