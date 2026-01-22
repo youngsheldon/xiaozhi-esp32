@@ -16,6 +16,9 @@
 #include <esp_timer.h>
 #include "esp_io_expander_tca9554.h"
 
+#include <esp_lcd_touch_cst816s.h>
+#include <esp_lvgl_port.h>
+
 #define TAG "waveshare_lcd_1_85c"
 
 #define LCD_OPCODE_WRITE_CMD        (0x02ULL)
@@ -354,6 +357,37 @@ private:
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
+    void InitializeTouch() {
+        esp_lcd_touch_handle_t tp;
+        esp_lcd_touch_config_t tp_cfg = {
+            .x_max = DISPLAY_WIDTH - 1,
+            .y_max = DISPLAY_HEIGHT - 1,
+            .rst_gpio_num = TP_PIN_NUM_RST,
+            .int_gpio_num = TP_PIN_NUM_INT,
+            .levels = {
+                .reset = 0,
+                .interrupt = 0,
+            },
+            .flags = {
+                .swap_xy = 0,
+                .mirror_x = 0,
+                .mirror_y = 0,
+            },
+        };
+        esp_lcd_panel_io_handle_t tp_io_handle = NULL;
+        esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
+        tp_io_config.scl_speed_hz = 400*  1000;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
+        ESP_LOGI(TAG, "Initialize touch controller");
+        ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, &tp));
+        const lvgl_port_touch_cfg_t touch_cfg = {
+            .disp = lv_display_get_default(),
+            .handle = tp,
+        };
+        lvgl_port_add_touch(&touch_cfg);
+        ESP_LOGI(TAG, "Touch panel initialized successfully");
+    }
+
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
@@ -372,6 +406,7 @@ public:
         InitializeTca9554();
         InitializeSpi();
         Initializest77916Display();
+        InitializeTouch();
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
     }
