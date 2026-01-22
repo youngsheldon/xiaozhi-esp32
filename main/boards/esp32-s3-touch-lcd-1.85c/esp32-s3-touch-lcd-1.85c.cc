@@ -457,6 +457,7 @@ private:
             GetBacklight()->SetBrightness(1);
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            esp_lcd_panel_disp_on_off(panel, true);
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
