@@ -18,6 +18,8 @@
 
 #include <esp_lcd_touch_cst816s.h>
 #include <esp_lvgl_port.h>
+#include "power_save_timer.h"
+#include <esp_sleep.h>
 
 #define TAG "waveshare_lcd_1_85c"
 
@@ -213,12 +215,54 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
     {0x29, (uint8_t []){0x00}, 1, 0},  
 };
 
+
+class CustomLcdDisplay : public SpiLcdDisplay {
+public:
+    static void rounder_event_cb(lv_event_t* e) {
+        lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
+        uint16_t x1 = area->x1;
+        uint16_t x2 = area->x2;
+
+        uint16_t y1 = area->y1;
+        uint16_t y2 = area->y2;
+
+        // round the start of coordinate down to the nearest 2M number
+        area->x1 = (x1 >> 1) << 1;
+        area->y1 = (y1 >> 1) << 1;
+        // round the end of coordinate up to the nearest 2N+1 number
+        area->x2 = ((x2 >> 1) << 1) + 1;
+        area->y2 = ((y2 >> 1) << 1) + 1;
+    }
+
+    CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
+                     esp_lcd_panel_handle_t panel_handle,
+                     int width,
+                     int height,
+                     int offset_x,
+                     int offset_y,
+                     bool mirror_x,
+                     bool mirror_y,
+                     bool swap_xy)
+        : SpiLcdDisplay(io_handle, panel_handle,
+                        width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
+        DisplayLockGuard lock(this);
+        lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES*  0.6, 0);
+        lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES*  0.6, 0);
+        lv_obj_set_style_pad_bottom(bottom_bar_, 60, 0);
+        lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+    }
+};
+
+
 class CustomBoard : public WifiBoard {
 private:
     Button boot_button_;
     i2c_master_bus_handle_t i2c_bus_;
     esp_io_expander_handle_t io_expander = NULL;
     LcdDisplay* display_;
+    PowerSaveTimer* power_save_timer_;
+    esp_lcd_panel_io_handle_t panel_io = nullptr;
+    esp_lcd_panel_handle_t panel = nullptr;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -270,9 +314,6 @@ private:
     }
 
     void Initializest77916Display() {
-        esp_lcd_panel_io_handle_t panel_io = nullptr;
-        esp_lcd_panel_handle_t panel = nullptr;
-
         ESP_LOGI(TAG, "Install panel IO");
 
         esp_lcd_panel_io_spi_config_t io_config = {
@@ -353,7 +394,7 @@ private:
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
-        display_ = new SpiLcdDisplay(panel_io, panel,
+        display_ = new CustomLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
@@ -390,6 +431,7 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            power_save_timer_->WakeUp();
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -397,6 +439,89 @@ private:
             }
             app.ToggleChatState();
         });
+
+        boot_button_.OnLongPress([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() != kDeviceStateStarting) {
+                ESP_LOGI(TAG, "boot button long pressed, shutting down");
+                esp_lcd_panel_disp_on_off(panel, false);  // 关闭显示
+                esp_deep_sleep_start();
+            }
+        });
+    }
+
+    void InitializePowerSaveTimer() {
+        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_->OnEnterSleepMode([this]() {
+            GetDisplay()->SetPowerSaveMode(true);
+            GetBacklight()->SetBrightness(1);
+        });
+        power_save_timer_->OnExitSleepMode([this]() {
+            GetDisplay()->SetPowerSaveMode(false);
+            GetBacklight()->RestoreBrightness();
+        });
+        power_save_timer_->OnShutdownRequest([this]() {
+            ESP_LOGI(TAG, "Shutting down");
+            esp_lcd_panel_disp_on_off(panel, false);  // 关闭显示
+        });
+        power_save_timer_->SetEnabled(true);
+    }
+
+    uint16_t BatterygetVoltage(void) {
+        static bool initialized = false;
+        static adc_oneshot_unit_handle_t adc_handle;
+        static adc_cali_handle_t cali_handle = NULL;
+        if (!initialized) {
+            adc_oneshot_unit_init_cfg_t init_config = {
+                .unit_id = ADC_UNIT_1,
+            };
+            adc_oneshot_new_unit(&init_config, &adc_handle);
+    
+            adc_oneshot_chan_cfg_t ch_config = {
+                .atten = ADC_ATTEN_DB_12,
+                .bitwidth = ADC_BITWIDTH_12,
+            };
+            adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_7, &ch_config);
+    
+            adc_cali_curve_fitting_config_t cali_config = {
+                .unit_id = ADC_UNIT_1,
+                .atten = ADC_ATTEN_DB_12,
+                .bitwidth = ADC_BITWIDTH_12,
+            };
+            if (adc_cali_create_scheme_curve_fitting(&cali_config, &cali_handle) == ESP_OK) {
+                initialized = true;
+            }
+        }
+
+        if (initialized) {
+            int raw_value = 0;
+            int raw_voltage = 0;
+            int voltage = 0; // mV
+            adc_oneshot_read(adc_handle, ADC_CHANNEL_7, &raw_value);
+            adc_cali_raw_to_voltage(cali_handle, raw_value, &raw_voltage);
+            voltage =  raw_voltage * 3;
+            // ESP_LOGI(TAG, "voltage: %dmV", voltage);
+            return (uint16_t)voltage;
+        }
+
+        return 0;
+    }
+
+    uint8_t BatterygetPercent() {
+        int voltage = 0;
+        for (uint8_t i = 0; i < 10; i++) {
+            voltage += BatterygetVoltage();
+        }
+
+        voltage /= 10;
+        int percent = (-1 * voltage * voltage + 9016 * voltage - 19189000) / 10000;
+        percent = (percent > 100) ? 100 : (percent < 0) ? 0 : percent;
+        // ESP_LOGI(TAG, "voltage: %dmV, percentage: %d%%", voltage, percent);
+        if(0 == percent)
+        {
+            percent = 100;
+        }
+        return (uint8_t)percent;
     }
 
 public:
@@ -408,6 +533,7 @@ public:
         Initializest77916Display();
         InitializeTouch();
         InitializeButtons();
+        InitializePowerSaveTimer();
         GetBacklight()->RestoreBrightness();
     }
 
@@ -425,6 +551,20 @@ public:
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
+    }
+
+    virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging) override {
+        level = (int)BatterygetPercent();
+        charging = (level == 100);
+        discharging = !charging;
+        return true;
+    }
+
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level != PowerSaveLevel::LOW_POWER) {
+            power_save_timer_->WakeUp();
+        }
+        WifiBoard::SetPowerSaveLevel(level);
     }
 };
 
