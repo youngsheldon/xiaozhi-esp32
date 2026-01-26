@@ -13,6 +13,7 @@
 #define TAG "Board"
 
 Board::Board() {
+    music_ = nullptr;  // 先初始化为空指针
     Settings settings("board", true);
     uuid_ = settings.GetString("uuid");
     if (uuid_.empty()) {
@@ -20,6 +21,18 @@ Board::Board() {
         settings.SetString("uuid", uuid_);
     }
     ESP_LOGI(TAG, "UUID=%s SKU=%s", uuid_.c_str(), BOARD_NAME);
+
+    // 初始化音乐播放器
+    music_ = new Esp32Music();
+    ESP_LOGI(TAG, "Music player initialized for all boards");
+}
+
+Board::~Board() {
+    if (music_) {
+        delete music_;
+        music_ = nullptr;
+        ESP_LOGI(TAG, "Music player destroyed");
+    }
 }
 
 std::string Board::GenerateUuid() {
@@ -175,4 +188,8 @@ std::string Board::GetSystemInfoJson() {
     // Close the JSON object
     json += R"(})";
     return json;
+}
+
+Music* Board::GetMusic() {
+    return music_;
 }

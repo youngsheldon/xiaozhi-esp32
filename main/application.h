@@ -119,6 +119,7 @@ public:
      * This includes closing audio channel, resetting protocol and ota objects
      */
     void ResetProtocol();
+    void AddAudioData(AudioStreamPacket&& packet);
 
 private:
     Application();
