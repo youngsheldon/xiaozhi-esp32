@@ -1141,10 +1141,10 @@ void Application::AddAudioData(AudioStreamPacket&& packet) {
             codec->OutputData(pcm_data);
             
             // 更新最后输出时间，防止OnAudioOutput自动禁用音频
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                last_output_time_ = std::chrono::steady_clock::now();
-            }
+            // {
+            //     std::lock_guard<std::mutex> lock(mutex_);
+            //     last_output_time_ = std::chrono::steady_clock::now();
+            // }
         }
     }
 }
