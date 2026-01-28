@@ -35,6 +35,7 @@ protected:
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+    bool play_music_status_ = false;
 
     void InitializeLcdThemes();
     void SetupUI();
@@ -56,6 +57,10 @@ public:
     
     // Set whether to hide chat messages/subtitles
     void SetHideSubtitle(bool hide);
+
+    virtual void SetMusicInfo(const char* song_name);
+    virtual void SetPlayMusicStatus(bool status) { play_music_status_ = status; }
+    virtual bool IsPlayMusicStatus() const { return play_music_status_; }
 };
 
 // SPI LCD display

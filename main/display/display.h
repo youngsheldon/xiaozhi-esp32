@@ -36,12 +36,12 @@ public:
     virtual void SetEmotion(const char* emotion);
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void SetMusicInfo(const char* song_name);
+    virtual void SetPlayMusicStatus(bool status);
+    virtual bool IsPlayMusicStatus();
     virtual void SetTheme(Theme* theme);
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
-    virtual void SetPlayMusicStatus(bool status) { play_music_status_ = status; }
-    virtual bool IsPlayMusicStatus() const { return play_music_status_; }
 
     inline int width() const { return width_; }
     inline int height() const { return height_; }
@@ -51,7 +51,6 @@ protected:
     int height_ = 0;
 
     Theme* current_theme_ = nullptr;
-    bool play_music_status_ = false;
 
     friend class DisplayLockGuard;
     virtual bool Lock(int timeout_ms = 0) = 0;

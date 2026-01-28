@@ -49,12 +49,6 @@ private:
     std::atomic<int> audio_channels_;           // 音频声道数（如2，从事件中获取）
     std::mutex audio_param_mutex_;              // 保护音频参数的互斥锁
     bool is_audio_param_ready_;                 // 音频参数（采样率、声道数）是否就绪
-    // 专辑封面相关
-    lv_img_dsc_t preview_image_;
-    JpegData jpeg_data_;
-    jpeg_dec_handle_t jpeg_dec_;
-    jpeg_dec_io_t *jpeg_io_;
-    jpeg_dec_header_info_t *jpeg_out_;
 
     void DownloadAudioStream(const std::string &music_url);
     void ResetSampleRate();

@@ -20,6 +20,7 @@
 
 #include "KwWork.h"
 #include "settings.h"
+#include "lvgl_display.h"
 
 #define TAG "Esp32Music"
 
@@ -156,93 +157,11 @@ Esp32Music::Esp32Music() : current_music_url_(), current_song_name_(), current_s
 {
     ESP_LOGI(TAG, "Music player initialized");
     std::thread(&Esp32Music::PlayNextDetect, this).detach();
-
-    // 初始化JPEG数据的内存
-    jpeg_data_.len = 0;
-    jpeg_data_.buf = (uint8_t *)heap_caps_malloc(IMG_JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    ;
-    if (jpeg_data_.buf == nullptr)
-    {
-        ESP_LOGE(TAG, "Failed to allocate memory for JPEG buffer");
-        return;
-    }
-
-    // 初始化JPEG解码
-    jpeg_dec_config_t config = {.output_type = JPEG_PIXEL_FORMAT_RGB565_LE, .rotate = JPEG_ROTATE_0D};
-    jpeg_error_t err;
-    err = jpeg_dec_open(&config, &jpeg_dec_);
-    if (err != JPEG_ERR_OK )
-    {
-        ESP_LOGE(TAG, "Failed to open JPEG decoder");
-        return;
-    }
-    jpeg_io_ = (jpeg_dec_io_t *)heap_caps_malloc(sizeof(jpeg_dec_io_t), MALLOC_CAP_SPIRAM);
-    if (!jpeg_io_)
-    {
-        ESP_LOGE(TAG, "Failed to allocate memory for JPEG IO");
-        jpeg_dec_close(jpeg_dec_);
-        return;
-    }
-    memset(jpeg_io_, 0, sizeof(jpeg_dec_io_t));
-
-    jpeg_out_ = (jpeg_dec_header_info_t *)heap_caps_aligned_alloc(16, sizeof(jpeg_dec_header_info_t), MALLOC_CAP_SPIRAM);
-    if (!jpeg_out_)
-    {
-        ESP_LOGE(TAG, "Failed to allocate memory for JPEG output header");
-        heap_caps_free(jpeg_io_);
-        jpeg_dec_close(jpeg_dec_);
-        return;
-    }
-    memset(jpeg_out_, 0, sizeof(jpeg_dec_header_info_t));
-
-    // 初始化预览图片的内存
-    memset(&preview_image_, 0, sizeof(preview_image_));
-    preview_image_.header.magic = LV_IMAGE_HEADER_MAGIC;
-    preview_image_.header.cf = LV_COLOR_FORMAT_RGB565;
-    preview_image_.header.flags = LV_IMAGE_FLAGS_ALLOCATED | LV_IMAGE_FLAGS_MODIFIABLE;
-    preview_image_.header.w = 240;
-    preview_image_.header.h = 240;
-
-    preview_image_.header.stride = preview_image_.header.w * 2;
-    preview_image_.data_size = preview_image_.header.w * preview_image_.header.h * 2;
-    preview_image_.data = (uint8_t *)heap_caps_malloc(preview_image_.data_size, MALLOC_CAP_SPIRAM);
-    if (preview_image_.data == nullptr)
-    {
-        ESP_LOGE(TAG, "Failed to allocate memory for preview image");
-        return;
-    }
 }
 
 Esp32Music::~Esp32Music()
 {
     ESP_LOGI(TAG, "Destroying music player - stopping all operations");
-
-    if (preview_image_.data)
-    {
-        heap_caps_free((void *)preview_image_.data);
-        preview_image_.data = nullptr;
-    }
-    if (jpeg_data_.buf)
-    {
-        heap_caps_free(jpeg_data_.buf);
-        jpeg_data_.buf = nullptr;
-    }
-    if (jpeg_dec_)
-    {
-        jpeg_dec_close(jpeg_dec_);
-        jpeg_dec_ = nullptr;
-    }
-    if (jpeg_io_)
-    {
-        heap_caps_free(jpeg_io_);
-        jpeg_io_ = nullptr;
-    }
-    if (jpeg_out_)
-    {
-        heap_caps_free(jpeg_out_);
-        jpeg_out_ = nullptr;
-    }
-
     if (asp_handle_)
     {
         assert(ESP_OK == esp_audio_simple_player_destroy(asp_handle_));
@@ -643,7 +562,7 @@ bool Esp32Music::StartStreaming(const std::string &music_url)
         cfg.task_prio = 5;
         cfg.task_core = 1;
         cfg.task_stack = 16 * 1024;
-        cfg.task_stack_in_ext = false;
+        // cfg.task_stack_in_ext = false;
         cfg.prev_ctx = NULL;
         cfg.prev = NULL;
 
@@ -745,69 +664,38 @@ void Esp32Music::setBackgroundImage(const std::string &albumId)
         return;
     }
 
-    auto network = Board::GetInstance().GetNetwork();
-    auto http = network->CreateHttp(0);
-    if (!http)
-    {
-        ESP_LOGE(TAG, "Failed to create HTTP client for image request");
-        return;
-    }
-    if (!http->Open("GET", cover_url))
-    {
-        ESP_LOGE(TAG, "Failed to connect to pic url");
-        return;
+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+
+    if (!http->Open("GET", cover_url)) {
+        throw std::runtime_error("Failed to open URL: " + cover_url);
     }
     int status_code = http->GetStatusCode();
-    if (status_code != 200)
-    {
-        ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
-        http->Close();
-        return;
+    if (status_code != 200) {
+        throw std::runtime_error("Unexpected status code: " + std::to_string(status_code));
     }
-    int bytes_read = http->Read((char *)jpeg_data_.buf, IMG_JPEG_BUF_SIZE);
-    if (bytes_read <= 0)
-    {
-        ESP_LOGE(TAG, "Failed to read data from image URL, bytes_read: %d", bytes_read);
-        http->Close();
-        return;
+
+    size_t content_length = http->GetBodyLength();
+    char* data = (char*)heap_caps_malloc(content_length, MALLOC_CAP_8BIT);
+    if (data == nullptr) {
+        throw std::runtime_error("Failed to allocate memory for image: " + cover_url);
+    }
+    size_t total_read = 0;
+    while (total_read < content_length) {
+        int ret = http->Read(data + total_read, content_length - total_read);
+        if (ret < 0) {
+            heap_caps_free(data);
+            throw std::runtime_error("Failed to download image: " + cover_url);
+        }
+        if (ret == 0) {
+            break;
+        }
+        total_read += ret;
     }
     http->Close();
-    jpeg_data_.buf = (uint8_t *)jpeg_data_.buf;
-    if (bytes_read > IMG_JPEG_BUF_SIZE)
-    {
-        ESP_LOGE(TAG, "Read more data than allocated buffer size: %d > %d", bytes_read, IMG_JPEG_BUF_SIZE);
-        return;
-    }
-    jpeg_data_.len = bytes_read;
-    // 检查JPEG解码资源是否已经分配
-    if (!jpeg_dec_ || !jpeg_io_ || !jpeg_out_ || !preview_image_.data)
-    {
-        ESP_LOGE(TAG, "Failed to allocate jpeg decoder resources");
-        return;
-    }
-    jpeg_io_->inbuf = jpeg_data_.buf;
-    jpeg_io_->inbuf_len = jpeg_data_.len;
-    // 解析JPEG头
-    auto ret = jpeg_dec_parse_header(jpeg_dec_, jpeg_io_, jpeg_out_);
-    if (ret < 0)
-    {
-        ESP_LOGE(TAG, "Failed to parse JPEG header, ret: %d", ret);
-        return;
-    }
-    // 设置输出缓冲区并处理解码
-    jpeg_io_->outbuf = (unsigned char *)preview_image_.data;
-    ret = jpeg_dec_process(jpeg_dec_, jpeg_io_);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to decode JPEG image, ret: %d", ret);
-        return;
-    }
-    // 显示预览图片
-    auto display = Board::GetInstance().GetDisplay();
-    if (display)
-    {
-        display->SetPreviewImage(&preview_image_);
-    }
+
+    auto image = std::make_unique<LvglAllocatedImage>(data, content_length);
+    auto display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay());
+    display->SetPreviewImage(std::move(image));
 }
 
 // 重置采样率到原始值
@@ -874,7 +762,6 @@ bool Esp32Music::Request(const std::string &url, std::string &response)
         if (!http->Open("GET", current_url))
         {
             ESP_LOGE(TAG, "Failed to open HTTP connection for request");
-            delete http;
             retry_count++;
             continue;
         }
@@ -889,7 +776,6 @@ bool Esp32Music::Request(const std::string &url, std::string &response)
             // 由于无法获取Location头，只能报告重定向但无法继续
             ESP_LOGW(TAG, "Received redirect status %d but cannot follow redirect (no GetHeader method)", status_code);
             http->Close();
-            delete http;
             retry_count++;
             continue;
         }
@@ -899,7 +785,6 @@ bool Esp32Music::Request(const std::string &url, std::string &response)
         {
             ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
             http->Close();
-            delete http;
             retry_count++;
             continue;
         }
@@ -955,7 +840,6 @@ bool Esp32Music::Request(const std::string &url, std::string &response)
         }
 
         http->Close();
-        delete http;
 
         if (read_error)
         {
